@@ -34,20 +34,47 @@ env = gym.make('FindSensePairs-v0')  # Replace 'YourEnvName-v0' with the ID you 
 
 
 
+def get_accuracy(net):
+    env.reset(no_step=True)
+    perf = 0
+    num_trial = 100
+    correct_predictions = 0
+    total_predictions = 0
+    for i in range(num_trial):
+        env.new_trial()
+        ob, gt = env.ob, env.gt
+        inputs = torch.from_numpy(ob[:, np.newaxis, :]).type(torch.float)
+        action_pred, rnn_activity = net(inputs)
+
+        # Calculate accuracy
+        predicted_actions = torch.argmax(action_pred[:,0,:], dim=-1).detach().numpy()
+        correct_predictions += np.sum(predicted_actions == gt)
+        total_predictions += gt.size
+
+    # Calculate overall accuracy
+    accuracy = correct_predictions / total_predictions
+    print(f"Accuracy: {accuracy * 100:.2f}%")
+    return accuracy
+
+#hyperparameters
+N = 100
+max_iters = 10000
+batch_size = 16
+learning_rate = 1e-3
 # Environment
-task = 'FindSensePairs-v0'
-kwargs = {'dt': 100, 'N': 4}
+task = 'FindSensePairs-v0' #'PerceptualDecisionMaking-v0'
+kwargs = {'dt': 100, 'N': N, 'interpolate_delay': 6}
+#kwargs = {'dt': 100}
 seq_len = 100
 
 
 # Make supervised dataset
-dataset = ngym.Dataset(task, env_kwargs=kwargs, batch_size=16,
+dataset = ngym.Dataset(task, env_kwargs=kwargs, batch_size=batch_size,
                        seq_len=seq_len)
 
 # A sample environment from dataset
 env = dataset.env
-# Visualize the environment with 2 sample trials
-_ = ngym.utils.plot_env(env, num_trials=2)
+
 
 # Network input and output size
 input_size = env.observation_space.shape[0]
@@ -66,53 +93,75 @@ net = RNNNet(input_size=input_size, hidden_size=hidden_size,
 print(net)
 
 # Use Adam optimizer
-optimizer = optim.Adam(net.parameters(), lr=0.01)
+optimizer = optim.Adam(net.parameters(), lr=learning_rate)
 criterion = nn.CrossEntropyLoss()
 
 running_loss = 0
 running_acc = 0
-for i in range(1000):
-    inputs, labels = dataset()
+correct_predictions = 0
+total_predictions = 0
+
+inputs, labels_orig = dataset()
+
+plt.figure()
+plt.imshow(inputs[:,0,:].squeeze().T)
+plt.show()
+
+for i in range(max_iters):
+    inputs, labels_orig = dataset()
     inputs = torch.from_numpy(inputs).type(torch.float)
-    labels = torch.from_numpy(labels.flatten()).type(torch.long)
+    labels = torch.from_numpy(labels_orig.flatten()).type(torch.long)
+    
 
     # in your training loop:
     optimizer.zero_grad()   # zero the gradient buffers
     output, _ = net(inputs)
+
     output = output.view(-1, output_size)
     loss = criterion(output, labels)
     loss.backward()
     optimizer.step()    # Does the update
+
+    
 
     running_loss += loss.item()
     if i % 100 == 99:
         running_loss /= 100
         print('Step {}, Loss {:0.4f}'.format(i+1, running_loss))
         running_loss = 0
+        # Calculate overall accuracy
+        accuracy = get_accuracy(net)
+    
+
+
 
 
     
-
+net.eval()
 env.reset(no_step=True)
 perf = 0
 num_trial = 100
 activity_dict = {}
 trial_infos = {}
 all_inputs = []
-for i in range(num_trial):
-    env.new_trial()
-    ob, gt = env.ob, env.gt
-    inputs = torch.from_numpy(ob[:, np.newaxis, :]).type(torch.float)
-    all_inputs.append(inputs.detach().numpy().squeeze())
-    action_pred, rnn_activity = net(inputs)
-    rnn_activity = rnn_activity[:, 0, :].detach().numpy()
-    activity_dict[i] = rnn_activity
-    trial_infos[i] = env.trial
+
+pairs = []
+N_div2 = int(N/2)
+for i in range(N_div2):
+    for j in range(N_div2):
+        pairs.append((i+1, j+N_div2+1))
+
+
     
 # Concatenate activity for PCA
 activity = np.concatenate(list(activity_dict[i] for i in range(num_trial)), axis=0)
 print('Shape of the neural activity: (Time points, Neurons): ', activity.shape)
 
+
+plt.figure()
+plt.imshow(inputs.detach().numpy().squeeze().T)
+plt.colorbar()
+plt.show()
 
 # Compute PCA and visualize
 

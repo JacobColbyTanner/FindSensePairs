@@ -22,7 +22,7 @@ class FindSensePairs(ngym.TrialEnv):
         'tags': ['perceptual', 'working memory', 'go-no-go', 'supervised']
     }
 
-    def __init__(self, dt=100, rewards=None, timing=None, sigma=1.0, N=4):
+    def __init__(self, dt=100, rewards=None, timing=None, sigma=1.0, N=4, interpolate_delay=2):
         super().__init__(dt=dt)
         self.choices = [0, 1]
         # trial conditions
@@ -46,13 +46,24 @@ class FindSensePairs(ngym.TrialEnv):
         if rewards:
             self.rewards.update(rewards)
 
+        #stim 1 is first stimuli, stim 2 is first and second, stim 3 is none, stim 4 is second stimuli
+        if interpolate_delay > 0:
+            stim2 = interpolate_delay*100
+            stim3 = 0
+        elif interpolate_delay < 0:
+            stim2 = 0
+            stim3 = -interpolate_delay*100
+        elif interpolate_delay == 0:
+            stim2 = 0
+            stim3 = 0
+
         self.timing = {
             'fixation': 0,
-            'stim1': 1000,
-            'delay_btw_stim': np.random.randint(500, 1000),
-            'stim2': 1000,
-            'delay_aft_stim': np.random.randint(500, 1000),
-            'decision': 500}
+            'stim1': 200,
+            'stim2': stim2,
+            'stim3': stim3,
+            'stim4': 200, #np.random.randint(500, 1000),
+            'decision': 3000}
         if timing:
             self.timing.update(timing)
 
@@ -73,14 +84,15 @@ class FindSensePairs(ngym.TrialEnv):
         trial.update(kwargs)
         pair = trial['pair']
 
-        periods = ['fixation', 'stim1', 'delay_btw_stim', 'stim2',
-                   'delay_aft_stim', 'decision']
+        periods = ['fixation', 'stim1', 'stim2', 'stim3', 'stim4', 'decision']
         self.add_period(periods)
 
         # set observations
         self.add_ob(1, where='fixation')
         self.add_ob(1, 'stim1', where=pair[0])
+        self.add_ob(1, 'stim2', where=pair[0])
         self.add_ob(1, 'stim2', where=pair[1])
+        self.add_ob(1, 'stim4', where=pair[1])
         self.set_ob(0, 'decision')
         # set ground truth
         self.set_groundtruth(trial['ground_truth'], 'decision')
