@@ -26,7 +26,7 @@ from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt 
 import numpy as np
 
-register(id = 'FindSensePairs-v0',entry_point= "neurogym.envs.FindSensePairs:FindSensePairs")
+register(id = 'FindSensePairs-v0',entry_point= "FindSensePairs:FindSensePairs")
 
 
 
