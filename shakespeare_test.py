@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from CTRNN import RNNNet, TransformRNNNet, TransformRNNNet2, ContextTransformRNNNet, ContextRNNNet, ActionMapRNNNet, OutputMapRNNNet, HiddenMapRNNNet, InputMapRNNNet
+from CTRNN import RNNNet, TransformRNNNet, TransformRNNNet2, ContextTransformRNNNet, ContextRNNNet, ActionMapRNNNet, OutputMapRNNNet, HiddenMapRNNNet, InputMapRNNNet, OutputMapLSTMNet, OutputMapContextMapRNNNet, ContextInputSubspaceRNNNet, SimpleLSTM, ActionEmbeddingActionMapNet
 import numpy as np
 import requests
 import os
@@ -40,7 +40,7 @@ def create_sequence_pairs(data, seq_length):
     return torch.stack(input_sequences), torch.stack(target_sequences)
 
 
-sequence_length = 8
+sequence_length = 32
 batch_size = 32  # Increased batch size to match original
 
 # Create input-target sequence pairs
@@ -62,9 +62,9 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
 # Model parameters
 input_size = vocab_size
-hidden_size = 10
-transform_context_size = 10
-transform_hidden_size = 20
+hidden_size = 50
+transform_context_size = 20
+transform_hidden_size = 4*transform_context_size
 output_size = vocab_size
 num_epochs = 5
 transform_learning_rate = 0.01
@@ -219,9 +219,9 @@ def load_model(model_class, model_name):
 
 
 # Test both models
-rnn_model = RNNNet(input_size, hidden_size, output_size).to(device)
-action_map_rnn_model = OutputMapRNNNet(
-    input_size, transform_context_size, transform_hidden_size, output_size).to(device)
+rnn_model = SimpleLSTM(input_size, hidden_size, output_size).to(device)
+action_map_rnn_model = ActionEmbeddingActionMapNet(
+    input_size, transform_context_size, output_size).to(device)
 
 # print the number of parameters in each model
 print(
@@ -229,16 +229,15 @@ print(
 print(
     f"Number of parameters in ActionMapRNN model: {sum(p.numel() for p in action_map_rnn_model.parameters())}")
 
+print("\nTraining RNN model...")
+rnn_loss, rnn_model = train_model(rnn_model, train_loader, val_loader,
+                                  num_epochs, learning_rate, "rnn")
+print(f"RNN Best Validation Loss: {rnn_loss:.4f}")
 
 print("\nTraining ActionMapRNN model...")
 action_map_rnn_loss, action_map_rnn_model = train_model(
     action_map_rnn_model, train_loader, val_loader, num_epochs, transform_learning_rate, "action_map_rnn")
 print(f"ActionMapRNN Best Validation Loss: {action_map_rnn_loss:.4f}")
-
-print("\nTraining RNN model...")
-rnn_loss, rnn_model = train_model(rnn_model, train_loader, val_loader,
-                                  num_epochs, learning_rate, "rnn")
-print(f"RNN Best Validation Loss: {rnn_loss:.4f}")
 
 
 print("\n\nGenerating text with ActionMapRNN model at temperature 0.8:")

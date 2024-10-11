@@ -4,6 +4,7 @@
 import numpy as np
 import neurogym as ngym
 from neurogym import spaces
+import random
 
 
 class ContextObjectStimuli(ngym.TrialEnv):
@@ -21,7 +22,7 @@ class ContextObjectStimuli(ngym.TrialEnv):
     }
 
     def __init__(self, dt=100, rewards=None, timing=None,
-                 num_contexts=2, num_objects=4, num_actions=1,
+                 num_contexts=2, num_objects=4, num_actions=1, object_sequence_length=4,
                  context_functions=None, trial_type="object_transition"):
         super().__init__(dt=dt)
 
@@ -31,8 +32,9 @@ class ContextObjectStimuli(ngym.TrialEnv):
         self.num_actions = num_actions + 1  # +1 for the 'no action'
         self.context_functions = context_functions or self._default_context_functions()
         self.trial_type = trial_type
+        self.object_sequence_length = object_sequence_length
 
-        assert trial_type in ["context_transition",
+        assert trial_type in ["context_memory",
                               "object_transition", "single_object"]
 
         # Rewards
@@ -41,17 +43,13 @@ class ContextObjectStimuli(ngym.TrialEnv):
             self.rewards.update(rewards)
 
         # Timing
-        if self.trial_type == "context_transition":
+        if self.trial_type == "context_memory":
             self.timing = {
-                'stim1': 1000,
-                'stim2': 1000,
-                'stim3': 1000,
-                'stim4': 1000,
-            }
+                f'stim{i+1}': 1000 for i in range(self.object_sequence_length)}
         elif self.trial_type == "object_transition":
             self.timing = {
-                'stim1': 1000,
-                'stim2': 1000,
+                'stim1': random.randint(300, 700),
+                'stim2': random.randint(300, 700),
             }
         else:  # single_object
             self.timing = {
@@ -76,8 +74,8 @@ class ContextObjectStimuli(ngym.TrialEnv):
         ]
 
     def _new_trial(self, **kwargs):
-        if self.trial_type == "context_transition":
-            return self._new_context_transition_trial(**kwargs)
+        if self.trial_type == "context_memory":
+            return self._new_context_memory_trial(**kwargs)
         elif self.trial_type == "object_transition":
             return self._new_object_transition_trial(**kwargs)
         else:  # single_object
@@ -137,48 +135,40 @@ class ContextObjectStimuli(ngym.TrialEnv):
 
         return trial
 
-    def _new_context_transition_trial(self, **kwargs):
-        # This is the same as the previous _new_transition_trial method
-        context1 = self.rng.choice(self.num_contexts)
-        context2 = self.rng.choice(self.num_contexts)
-        while context2 == context1:
-            context2 = self.rng.choice(self.num_contexts)
+    def _new_context_memory_trial(self, **kwargs):
+        # Choose a single context
+        context = self.rng.choice(self.num_contexts)
 
-        object1 = self.rng.choice(self.num_objects)
-        object2 = self.rng.choice(self.num_objects)
-        object3 = self.rng.choice(self.num_objects)
-        object4 = self.rng.choice(self.num_objects)
+        # Choose objects based on object_sequence_length
+        objects = self.rng.choice(
+            self.num_objects, size=self.object_sequence_length)
 
-        action1 = self.context_functions[context1][object1]
-        action2 = self.context_functions[context1][object2]
-        action3 = self.context_functions[context2][object3]
-        action4 = self.context_functions[context2][object4]
+        # Determine correct actions for each object
+        actions = [self.context_functions[context][obj] for obj in objects]
 
         trial = {
-            'context1': context1,
-            'context2': context2,
-            'object1': object1,
-            'object2': object2,
-            'object3': object3,
-            'object4': object4,
-            'action1': action1,
-            'action2': action2,
-            'action3': action3,
-            'action4': action4,
+            'context': context,
+            'objects': objects,
+            'actions': actions,
         }
         trial.update(kwargs)
 
-        self.add_period(['stim1', 'stim2', 'stim3', 'stim4'])
+        # Add periods for each stimulus
+        self.add_period(
+            [f'stim{i+1}' for i in range(self.object_sequence_length)])
 
-        self.add_ob(1, 'stim1', where=[context1, self.num_contexts + object1])
-        self.add_ob(1, 'stim2', where=[context1, self.num_contexts + object2])
-        self.add_ob(1, 'stim3', where=[context2, self.num_contexts + object3])
-        self.add_ob(1, 'stim4', where=[context2, self.num_contexts + object4])
+        # Add context only for the first object
+        self.add_ob(1, 'stim1', where=[
+                    context, self.num_contexts + objects[0]])
 
-        self.set_groundtruth(action1, 'stim1')
-        self.set_groundtruth(action2, 'stim2')
-        self.set_groundtruth(action3, 'stim3')
-        self.set_groundtruth(action4, 'stim4')
+        # For the remaining objects, only show the object, not the context
+        for i in range(1, self.object_sequence_length):
+            self.add_ob(1, f'stim{i+1}',
+                        where=[self.num_contexts + objects[i]])
+
+        # Set ground truth for all stimuli
+        for i, action in enumerate(actions):
+            self.set_groundtruth(action, f'stim{i+1}')
 
         return trial
 

@@ -12,7 +12,7 @@ class CTRNN(nn.Module):
     Parameters:
         input_size: Number of input neurons
         hidden_size: Number of hidden neurons
-        dt: discretization time step in ms. 
+        dt: discretization time step in ms.
             If None, dt equals time constant tau
 
     Inputs:
@@ -79,7 +79,7 @@ class CTRNN(nn.Module):
         output = torch.stack(output, dim=0)  # (seq_len, batch, hidden_size)
         input_projection = torch.stack(input_projection, dim=0)
 
-        return output, hidden, input_projection
+        return output, hidden
 
 
 class RNNNet(nn.Module):
@@ -108,9 +108,9 @@ class RNNNet(nn.Module):
         self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x, num_steps=1):
-        rnn_output, hidden, input_projection = self.rnn(x, num_steps=num_steps)
+        rnn_output, hidden = self.rnn(x, num_steps=num_steps)
         out = self.fc(rnn_output)
-        return out, rnn_output
+        return out, hidden
 
 
 class TransformCTRNN(nn.Module):
@@ -119,7 +119,7 @@ class TransformCTRNN(nn.Module):
     Parameters:
         input_size: Number of input neurons
         hidden_size: Number of hidden neurons
-        dt: discretization time step in ms. 
+        dt: discretization time step in ms.
             If None, dt equals time constant tau
         train_transform_increment_coeff: If True, transform increment coefficient is learnable
 
@@ -254,7 +254,7 @@ class TransformCTRNN2(nn.Module):
     Parameters:
         input_size: Number of input neurons
         hidden_size: Number of hidden neurons
-        dt: discretization time step in ms. 
+        dt: discretization time step in ms.
             If None, dt equals time constant tau
         train_transform_increment_coeff: If True, transform increment coefficient is learnable
 
@@ -643,7 +643,7 @@ class BasicResidualNN(nn.Module):
 
 
 class OutputMapCTRNN(nn.Module):
-    def __init__(self, input_size, context_size, hidden_size, output_size, use_tanh=False, dt=None, train_alpha=False):
+    def __init__(self, input_size, context_size, hidden_size, output_size, use_tanh=False, dt=None, train_alpha=True):
         super().__init__()
         self.input_size = input_size
         self.context_size = context_size
@@ -676,16 +676,29 @@ class OutputMapCTRNN(nn.Module):
         return torch.zeros(batch_size, self.context_size)
 
     def recurrence(self, input, context):
+        # Update context
+        # context_new = torch.relu(self.context2context(
+        #    context) + self.input2context(input))
+        # context = context * (1 - self.alpha) + context_new * self.alpha
+
+        # Here's a new idea for a recurrent network:
+        # Maybe we can assume that at every point in time, there are
+        # two learnable complementary subspaces of the embedding space, one for the context and one for the input,
+        # but these subspaces change depending on the previous context.
+        # So we can generate two matrices with complementary null spaces?
+        # The context matrix maps any embedding vector with only input information to zero
+        # and the input matrix maps any embedding vector with only context information to zero.
+        # But what is input information and what is context information depends on the previous context.
+
+        # Old version
+        context = context * (1 - self.alpha) + \
+            self.input2context(input) * self.alpha
+
         # Compute action map from context
         output_map = self.context2output_map(
             context).view(-1, self.output_size, self.hidden_size)
         # add layer norm
         output_map = nn.LayerNorm(self.hidden_size)(output_map)
-
-        # Update context
-        context_new = torch.relu(self.context2context(
-            context) + self.input2context(input))
-        context = context * (1 - self.alpha) + context_new * self.alpha
 
         hidden0 = torch.relu(self.input2hidden(input))
         hidden1 = torch.relu(self.hidden2hidden(hidden0)) + hidden0
@@ -721,8 +734,206 @@ class OutputMapRNNNet(nn.Module):
         self.rnn = OutputMapCTRNN(
             input_size, context_size, hidden_size, output_size, **kwargs)
 
-    def forward(self, x, context=None, num_steps=1):
-        return self.rnn(x, context, num_steps=num_steps)
+    def forward(self, x, num_steps=1):
+        return self.rnn(x, num_steps=num_steps)
+
+
+class FeedFoward(nn.Module):
+    """ A simple linear layer followed by a non-linearity """
+
+    def __init__(self, embedding_size, memory_size):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embedding_size, embedding_size),
+            nn.ReLU(),
+            nn.Linear(embedding_size, memory_size),
+            nn.Dropout(0),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ContextInputSubspaceCTRNN(nn.Module):
+    def __init__(self, input_size, memory_size, embedding_size, output_size, use_tanh=False, dt=None, train_alpha=True):
+        super().__init__()
+        self.input_size = input_size
+        self.memory_size = memory_size
+        self.embedding_size = embedding_size
+        self.output_size = output_size
+        self.tau = 100
+        if dt is None:
+            alpha = 1
+        else:
+            alpha = dt / self.tau
+
+        if train_alpha:
+            self.alpha = nn.Parameter(torch.tensor(alpha, dtype=torch.float32))
+        else:
+            self.register_buffer('alpha', torch.tensor(
+                alpha, dtype=torch.float32))
+
+        self.beta_power = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.beta_mult = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+
+        self.input2embedding = nn.Linear(
+            input_size, self.embedding_size, bias=False)
+
+        self.embedding2memory = nn.Linear(
+            self.embedding_size, self.memory_size, bias=False)
+        self.embedding2actionable = nn.Linear(
+            self.embedding_size, self.memory_size, bias=False)
+
+        self.context2context_map = nn.Linear(
+            self.memory_size, self.memory_size * self.output_size, bias=False)
+
+    def init_hidden(self, batch_size):
+        return torch.zeros(batch_size, self.memory_size)
+
+    def recurrence(self, input, context):
+
+        input_embedding = self.input2embedding(input)
+
+        context_portion = self.embedding2memory(input_embedding)
+        actionable_portion = self.embedding2actionable(input_embedding)
+
+        context_portion_norm = torch.norm(
+            context_portion, p=2, dim=1).unsqueeze(1)
+        context_norm = torch.norm(context, p=2, dim=1).unsqueeze(1)
+
+        beta = self.alpha * (self.beta_mult * (context_portion_norm /
+                             (context_portion_norm + context_norm))) ** self.beta_power
+
+        # clamp beta to be between 0 and 1
+        beta = torch.clamp(beta, 0, 1)
+
+        context = (1-beta) * context + beta * context_portion
+
+        # Compute action map from context
+        context_map = self.context2context_map(
+            context).view(-1, self.output_size, self.memory_size)
+
+        # Apply action map to input
+        output = torch.bmm(
+            context_map, actionable_portion.unsqueeze(-1)).squeeze(-1)
+
+        return output, context
+
+    def forward(self, input, context=None, num_steps=1):
+        if context is None:
+            context = self.init_hidden(input.shape[1])
+            context = context.to(input.device)
+        else:
+            context = context
+
+        outputs = []
+        steps = range(input.size(0))
+        for i in steps:
+            output = None
+            for _ in range(num_steps):
+                output, context = self.recurrence(
+                    input[i], context)
+            outputs.append(output)
+
+        outputs = torch.stack(outputs, dim=0)
+        return outputs, context
+
+
+class ContextInputSubspaceRNNNet(nn.Module):
+    def __init__(self, input_size, memory_size, embedding_size, output_size, **kwargs):
+        super().__init__()
+        self.rnn = ContextInputSubspaceCTRNN(
+            input_size, memory_size, embedding_size, output_size, **kwargs)
+
+    def forward(self, x, num_steps=1):
+        return self.rnn(x, num_steps=num_steps)
+
+
+class ActionEmbeddingActionMap(nn.Module):
+    def __init__(self, input_size, action_embedding_size, output_size, use_tanh=False, dt=None, train_alpha=True):
+        super().__init__()
+        self.input_size = input_size
+        self.action_embedding_size = action_embedding_size
+        self.output_size = output_size
+        self.tau = 100
+        if dt is None:
+            alpha = 0.1
+        else:
+            alpha = dt / self.tau
+
+        if train_alpha:
+            self.alpha = nn.Parameter(torch.tensor(alpha, dtype=torch.float32))
+        else:
+            self.register_buffer('alpha', torch.tensor(
+                alpha, dtype=torch.float32))
+
+        # learn the initial action_map
+        self.action_map_init = nn.Parameter(torch.randn(
+            self.action_embedding_size ** 2))
+
+        self.input2action_embedding = nn.Linear(
+            input_size, self.action_embedding_size)
+
+        self.action_embedding2action_map = nn.Linear(
+            self.action_embedding_size, self.action_embedding_size ** 2, bias=False)
+
+        self.action_embedding2action = nn.Linear(
+            self.action_embedding_size, self.output_size)
+
+        self.action_embedding_norm = nn.LayerNorm(self.action_embedding_size)
+        self.action_map_norm = nn.LayerNorm(self.action_embedding_size ** 2)
+
+    def init_hidden(self, batch_size):
+        return self.action_map_init.repeat(batch_size, 1)
+
+    def recurrence(self, input, action_map):
+
+        action_embedding = self.input2action_embedding(input)
+
+        # reshape action_map to be a square matrix
+        action_map = action_map.view(-1, self.action_embedding_size,
+                                     self.action_embedding_size)
+        action_embedding = torch.bmm(
+            action_map, action_embedding.unsqueeze(-1)).squeeze(-1)
+
+        action_map = (1-self.alpha) * action_map.flatten(1) + \
+            self.alpha * self.action_embedding2action_map(action_embedding)
+
+        action_map = self.action_map_norm(action_map)
+        action_embedding = self.action_embedding_norm(action_embedding)
+
+        output = self.action_embedding2action(action_embedding)
+
+        return output, action_map
+
+    def forward(self, input, action_map=None, num_steps=1):
+        if action_map is None:
+            action_map = self.init_hidden(input.shape[1])
+            action_map = action_map.to(input.device)
+        else:
+            action_map = action_map
+
+        outputs = []
+        steps = range(input.size(0))
+        for i in steps:
+            output = None
+            for _ in range(num_steps):
+                output, action_map = self.recurrence(
+                    input[i], action_map)
+            outputs.append(output)
+
+        outputs = torch.stack(outputs, dim=0)
+        return outputs, action_map
+
+
+class ActionEmbeddingActionMapNet(nn.Module):
+    def __init__(self, input_size, action_embedding_size, output_size, **kwargs):
+        super().__init__()
+        self.rnn = ActionEmbeddingActionMap(
+            input_size, action_embedding_size, output_size, **kwargs)
+
+    def forward(self, x, num_steps=1):
+        return self.rnn(x, num_steps=num_steps)
 
 
 class HiddenMapCTRNN(nn.Module):
@@ -900,3 +1111,249 @@ class InputMapRNNNet(nn.Module):
 
     def forward(self, x, context=None, num_steps=1):
         return self.rnn(x, context, num_steps=num_steps)
+
+
+class OutputMapLSTM(nn.Module):
+    def __init__(self, input_size, context_size, hidden_size, output_size, use_tanh=False):
+        super().__init__()
+        self.input_size = input_size
+        self.context_size = context_size
+        self.output_size = output_size
+        self.hidden_size = hidden_size
+
+        # Change LSTM initialization to include num_layers
+        self.num_layers = 1  # You can adjust this if needed
+        self.lstm = nn.LSTM(input_size, context_size,
+                            num_layers=self.num_layers)
+
+        self.input2hidden = BasicResidualNN(input_size, self.hidden_size)
+
+        self.hidden2hidden = nn.Linear(self.hidden_size, self.hidden_size)
+
+        self.context2output_map = nn.Linear(
+            self.context_size, self.hidden_size * output_size)
+
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(self.hidden_size)
+
+        # Activation function
+        self.activation = nn.Tanh() if use_tanh else nn.ReLU()
+
+    def init_hidden(self, batch_size):
+        # Update to return 3D tensors
+        return (torch.zeros(self.num_layers, batch_size, self.context_size),
+                torch.zeros(self.num_layers, batch_size, self.context_size))
+
+    def recurrence(self, input, hidden):
+        # Unpack hidden state
+        context, cell_state = hidden
+
+        # Update context using LSTM
+        context_input = input.unsqueeze(0)  # Add sequence length dimension
+        context_output, (context, cell_state) = self.lstm(
+            context_input, (context, cell_state))
+
+        # Remove sequence length dimension from context_output
+        context_output = context_output.squeeze(0)
+
+        # Compute output map from context_output
+        output_map = self.context2output_map(
+            context_output).view(-1, self.output_size, self.hidden_size)
+        output_map = self.layer_norm(output_map)
+
+        hidden0 = self.activation(self.input2hidden(input))
+        hidden1 = self.activation(self.hidden2hidden(hidden0)) + hidden0
+
+        # Apply output map to hidden state
+        output = torch.bmm(output_map, hidden1.unsqueeze(-1)).squeeze(-1)
+
+        return output, (context, cell_state)
+
+    def forward(self, input, hidden=None, num_steps=1):
+        if hidden is None:
+            hidden = self.init_hidden(input.shape[1])
+            hidden = (hidden[0].to(input.device), hidden[1].to(input.device))
+
+        outputs = []
+        steps = range(input.size(0))
+        for i in steps:
+            output = None
+            for _ in range(num_steps):
+                output, hidden = self.recurrence(input[i], hidden)
+            outputs.append(output)
+
+        outputs = torch.stack(outputs, dim=0)
+        return outputs, hidden
+
+
+class OutputMapLSTMNet(nn.Module):
+    def __init__(self, input_size, context_size, hidden_size, output_size, **kwargs):
+        super().__init__()
+        self.rnn = OutputMapLSTM(
+            input_size, context_size, hidden_size, output_size, **kwargs)
+
+    def forward(self, x, hidden=None, num_steps=1):
+        return self.rnn(x, hidden, num_steps=num_steps)
+
+
+class OutputMapLSTMNet(nn.Module):
+    def __init__(self, input_size, context_size, hidden_size, output_size, **kwargs):
+        super().__init__()
+        self.rnn = OutputMapLSTM(
+            input_size, context_size, hidden_size, output_size, **kwargs)
+
+    def forward(self, x, hidden=None, num_steps=1):
+        return self.rnn(x, hidden, num_steps=num_steps)
+
+
+class OutputMapContextMapCTRNN(nn.Module):
+    def __init__(self, input_size, context_size, output_size, use_tanh=False, dt=None, train_alpha=False):
+        super().__init__()
+        self.input_size = input_size
+        self.context_size = context_size
+        self.output_size = output_size
+        self.tau = 100
+        if dt is None:
+            alpha = 1.0
+        else:
+            alpha = dt / self.tau
+
+        if train_alpha:
+            self.alpha = nn.Parameter(torch.tensor(alpha, dtype=torch.float32))
+        else:
+            self.register_buffer('alpha', torch.tensor(
+                alpha, dtype=torch.float32))
+
+        # Context RNN
+        self.context2context = nn.Linear(self.context_size, self.context_size)
+        self.input2context = nn.Linear(input_size, self.context_size)
+
+        self.context2hidden = nn.Linear(self.context_size, self.context_size)
+        self.hidden2hidden = nn.Linear(self.context_size, self.context_size)
+
+        self.context2output_map = nn.Linear(
+            self.context_size, self.context_size * self.context_size)
+
+        self.input2context_map = nn.Linear(
+            self.context_size, self.context_size ** 2)
+
+        self.output_layer = nn.Linear(self.context_size, output_size)
+
+    def init_hidden(self, batch_size):
+        return torch.zeros(batch_size, self.context_size)
+
+    def recurrence(self, input, context):
+        input_proj = self.input2context(input)
+
+        # Update context
+        context_new = torch.relu(self.context2context(
+            context) + input_proj)
+        context = context * (1 - self.alpha) + context_new * self.alpha
+
+        # Compute context map from input
+        # context_map = self.input2context_map(
+        #    input_proj).view(-1, self.context_size, self.context_size)
+        # context_map = nn.LayerNorm(self.context_size)(context_map)
+
+        # context = torch.bmm(context_map, context.unsqueeze(-1)
+        #                    ).squeeze(-1) + input_proj
+
+        hidden0 = torch.relu(self.context2hidden(context))
+        hidden1 = torch.relu(self.hidden2hidden(hidden0)) + hidden0
+
+        # Compute output map from context
+        output_map = self.context2output_map(
+            context).view(-1, self.context_size, self.context_size)
+        # add layer norm
+        output_map = nn.LayerNorm(self.context_size)(output_map)
+
+        # Apply action map to input
+        almost_output = torch.bmm(output_map, hidden1.unsqueeze(-1)
+                                  ).squeeze(-1) + input_proj
+
+        output = self.output_layer(almost_output)
+
+        return output, context
+
+    def forward(self, input, context=None, num_steps=1):
+        if context is None:
+            context = self.init_hidden(input.shape[1])
+            context = context.to(input.device)
+        else:
+            context = context
+
+        outputs = []
+        steps = range(input.size(0))
+        for i in steps:
+            output = None
+            for _ in range(num_steps):
+                output, context = self.recurrence(
+                    input[i], context)
+            outputs.append(output)
+
+        outputs = torch.stack(outputs, dim=0)
+        return outputs, context
+
+
+class OutputMapContextMapRNNNet(nn.Module):
+    def __init__(self, input_size, context_size, output_size, **kwargs):
+        super().__init__()
+        self.rnn = OutputMapContextMapCTRNN(
+            input_size, context_size, output_size, **kwargs)
+
+    def forward(self, x, num_steps=1):
+        return self.rnn(x, num_steps=num_steps)
+
+
+class SimpleLSTM(nn.Module):
+    """Simple LSTM model with input and output projections.
+
+    Parameters:
+        input_size: Number of input neurons
+        hidden_size: Number of hidden neurons
+        output_size: Number of output neurons
+
+    Inputs:
+        input: tensor of shape (seq_len, batch, input_size)
+        hidden: tuple of tensors (h0, c0), each of shape (1, batch, hidden_size)
+            if None, hidden is initialized through self.init_hidden()
+
+    Outputs:
+        output: tensor of shape (seq_len, batch, output_size)
+        hidden: tuple of tensors (hn, cn), each of shape (1, batch, hidden_size)
+        input_projection: tensor of shape (seq_len, batch, hidden_size)
+    """
+
+    def __init__(self, input_size, hidden_size, output_size, **kwargs):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+
+        self.input_projection = nn.Linear(input_size, hidden_size)
+        self.lstm = nn.LSTM(hidden_size, hidden_size, batch_first=False)
+        self.output_projection = nn.Linear(hidden_size, output_size)
+
+    def init_hidden(self, input_shape):
+        batch_size = input_shape[1]
+        return (torch.zeros(1, batch_size, self.hidden_size),
+                torch.zeros(1, batch_size, self.hidden_size))
+
+    def forward(self, input, hidden=None, num_steps=1):
+        """Propagate input through the network."""
+
+        # If hidden state is not provided, initialize it
+        if hidden is None:
+            hidden = self.init_hidden(input.shape)
+            hidden = (hidden[0].to(input.device), hidden[1].to(input.device))
+
+        # Project input
+        input_projected = self.input_projection(input)
+
+        # Process input through LSTM
+        lstm_output, (hn, cn) = self.lstm(input_projected, hidden)
+
+        # Project output
+        output = self.output_projection(lstm_output)
+
+        return output, cn

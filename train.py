@@ -1,4 +1,4 @@
-from CTRNN import RNNNet, TransformRNNNet, ActionMapRNNNet, OutputMapRNNNet, HiddenMapRNNNet
+from CTRNN import RNNNet, TransformRNNNet, ActionMapRNNNet, OutputMapRNNNet, HiddenMapRNNNet, ContextInputSubspaceRNNNet, ActionEmbeddingActionMapNet, SimpleLSTM
 import os
 import sys
 import numpy as np
@@ -10,6 +10,7 @@ import neurogym as ngym
 import matplotlib.pyplot as plt
 import pickle
 import datetime
+import random
 
 # Add the current directory to the Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -33,8 +34,14 @@ def create_object_selector_functions(num_contexts, num_objects):
     ]
 
 
-def train_rnn(net, dataset, criterion, optimizer, num_epochs, batch_size):
+def train_rnn(net, dataset, criterion, optimizer, num_epochs, batch_size, env_params, model_params):
+    best_accuracy = 0
+    best_model = None
     running_loss = 0
+
+    # Calculate timestamp at the beginning of training
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
     for epoch in range(num_epochs):
         inputs, labels = dataset()
         inputs = torch.from_numpy(inputs).float()
@@ -71,6 +78,24 @@ def train_rnn(net, dataset, criterion, optimizer, num_epochs, batch_size):
                 print(f'Raw Accuracy: {accuracy:.2f}%')
                 print(f'Baseline Accuracy: {baseline_accuracy:.2f}%')
                 print(f'Scaled Accuracy: {scaled_accuracy:.2f}%')
+
+                # Save the best model
+                if scaled_accuracy > best_accuracy:
+                    best_accuracy = scaled_accuracy
+                    best_model = net.state_dict().copy()
+                    print(
+                        f'New best model saved with accuracy: {best_accuracy:.2f}%')
+
+                    # Save the best model using save_agent
+                    net.load_state_dict(best_model)
+                    save_agent(net, env_params, model_params, timestamp)
+
+    # Load the best model before returning
+    if best_model is not None:
+        net.load_state_dict(best_model)
+        print(f'Loaded best model with accuracy: {best_accuracy:.2f}%')
+    else:
+        print('No best model was saved during training.')
 
     return net
 
@@ -116,10 +141,7 @@ def plot_network_performance(net, dataset):
     plt.show()
 
 
-def save_agent(net, env_params, model_params):
-    # Create a timestamp for unique filename
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
+def save_agent(net, env_params, model_params, timestamp):
     # Create the saved_agents directory if it doesn't exist
     save_dir = 'saved_agents'
     if not os.path.exists(save_dir):
@@ -142,25 +164,36 @@ def save_agent(net, env_params, model_params):
 
 def main():
     # Hyperparameters
-    num_contexts = 2
-    num_objects = 2
+    num_contexts = 50
+    num_objects = 10
     num_actions = 1
     batch_size = 64
-    hidden_size = 3
-    learning_rate = 1e-2
+    hidden_size = 20
+    learning_rate = 1e-3
     num_epochs = 1000
 
     # Create the object selector functions
     context_functions = create_object_selector_functions(
         num_contexts, num_objects)
 
+    # Random context functions
+    rng = np.random.default_rng()
+    random_context_functions = [
+        {obj: rng.choice(range(num_actions+1))
+         for obj in range(num_objects)}
+        for _ in range(num_contexts)
+    ]
+
+    use_random_context_functions = True
+
     # Create the dataset
     env_params = {
         'num_contexts': num_contexts,
         'num_objects': num_objects,
         'num_actions': num_actions,
-        'context_functions': context_functions,
-        'trial_type': "object_transition"
+        'context_functions': random_context_functions if use_random_context_functions else context_functions,
+        'trial_type': "context_memory",
+        'object_sequence_length': 7
     }
 
     # Create the environment first to access its timing information
@@ -178,21 +211,17 @@ def main():
 
     # Create the RNN
     if USE_TRANSFORM_RNN:
-        net = OutputMapRNNNet(input_size, hidden_size, 10,
-                              output_size, use_tanh=True)
+        net = ActionEmbeddingActionMapNet(
+            input_size, hidden_size, output_size)
         print("Using OutputMapRNNNet")
     else:
-        net = RNNNet(input_size, hidden_size, output_size)
+        net = SimpleLSTM(input_size, hidden_size, output_size)
         print("Using RNNNet")
 
-    # Define loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(net.parameters(), lr=learning_rate)
+    # print the number of parameters
+    print(f"Number of parameters: {sum(p.numel() for p in net.parameters())}")
 
-    # Train the RNN
-    net = train_rnn(net, dataset, criterion, optimizer, num_epochs, batch_size)
-
-    # Save the trained agent
+    # Define model_params
     model_params = {
         'input_size': input_size,
         'hidden_size': hidden_size,
@@ -202,7 +231,14 @@ def main():
         'batch_size': batch_size,
         'use_transform_rnn': USE_TRANSFORM_RNN
     }
-    save_agent(net, env_params, model_params)
+
+    # Define loss function and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(net.parameters(), lr=learning_rate)
+
+    # Train the RNN
+    net = train_rnn(net, dataset, criterion, optimizer,
+                    num_epochs, batch_size, env_params, model_params)
 
     # Plot network performance after training
     plot_network_performance(net, dataset)
